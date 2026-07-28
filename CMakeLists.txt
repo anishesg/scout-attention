@@ -29,9 +29,18 @@ set_target_properties(attention_kernels PROPERTIES
 add_executable(test_correctness tests/test_correctness.cu)
 target_link_libraries(test_correctness PRIVATE attention_kernels)
 
+# Causal correctness test
+add_executable(test_causal tests/test_causal.cu)
+target_link_libraries(test_causal PRIVATE attention_kernels)
+
 # Benchmark
 add_executable(bench_attention benchmarks/bench_attention.cu)
 target_link_libraries(bench_attention PRIVATE attention_kernels)
 
+# Causal sparsity benchmark
+add_executable(bench_causal benchmarks/bench_causal.cu)
+target_link_libraries(bench_causal PRIVATE attention_kernels)
+
 enable_testing()
 add_test(NAME correctness COMMAND test_correctness)
+add_test(NAME causal_correctness COMMAND test_causal)
