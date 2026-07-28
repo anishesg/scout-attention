@@ -172,6 +172,13 @@ __global__ void scout_attention_kernel(
             }
 
             // ---- Phase 2: Full attention ----
+            // For causal mode, if the entire tile is above q_row (k_tile_start > q_row),
+            // all logits will be -inf after masking; skip smem loads entirely.
+            if (causal && k_tile_start > q_row) {
+                tiles_skipped_qi++;
+                continue;
+            }
+
             // Load remaining K columns (DS..D-1) -- reuse same smem_K buffer
             if (tid == 0) {
                 for (int ki = 0; ki < TK; ++ki) {
@@ -201,7 +208,7 @@ __global__ void scout_attention_kernel(
                     int k_row = k_tile_start + ki;
                     if (k_row >= S_k) { logits[ki] = -1e38f; continue; }
 
-                    // Apply causal mask: positions where k_row > q_row are invalid.
+                    // Apply causal mask: k positions after q position get -inf.
                     if (causal && k_row > q_row) { logits[ki] = -1e38f; continue; }
 
                     float dot = 0.0f;
@@ -212,8 +219,7 @@ __global__ void scout_attention_kernel(
                     min_kept_logit = fminf(min_kept_logit, logits[ki]);
                 }
 
-                // If all logits are -inf (can happen for partial causal tiles),
-                // skip the softmax update entirely to avoid NaN.
+                // No valid logits in this tile (partial causal tile fully above diagonal).
                 if (tile_max <= -1e37f) goto next_tile;
 
                 {
