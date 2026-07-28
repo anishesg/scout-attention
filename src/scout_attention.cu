@@ -1,6 +1,7 @@
 #include "scout_attention.cuh"
 #include "scout_score.cuh"
 #include "../include/tile_config.cuh"
+#include "../include/causal_config.cuh"
 #include <cstring>
 #include <algorithm>
 
@@ -19,9 +20,16 @@
 //   If ALL query rows in the tile score below threshold -> skip tile.
 //   (Conservative: skip only if every query agrees, reduces false skips.)
 //
+//   Causal integration in scout phase:
+//   - TILE_FULLY_MASKED tiles are skipped unconditionally (free sparsity).
+//   - TILE_PARTIAL tiles: scout score is scaled by visible_fraction to reflect
+//     that only a subset of keys are valid. This prevents partial tiles from
+//     appearing falsely important based on keys that will be masked to -inf.
+//
 // Phase 2 -- Full attention (for non-skipped tiles):
 //   Load K_tile[:, D_SCOUT:] to complete K, load V_tile.
 //   Run standard FlashAttention-2 tile update with online softmax.
+//   Causal mask applied per-element: logit = -inf for k_pos > q_pos.
 //
 // Correction (SCOUT_USE_CORRECTION):
 //   After the loop, the normalization denominator row_sum reflects only
@@ -41,7 +49,7 @@ __global__ void scout_attention_kernel(
     const float* __restrict__ thresholds,  // [B, H, num_q_tiles] or nullptr
     int* __restrict__ skip_counts,         // [B, H, num_q_tiles] output, or nullptr
     int B, int H, int S_q, int S_k, int D,
-    float scale, float keep_frac, int num_q_tiles)
+    float scale, float keep_frac, int num_q_tiles, bool causal)
 {
     // Shared memory layout:
     //   smem_Q_full : [TQ][D]       full Q tile (always loaded once)
@@ -95,6 +103,19 @@ __global__ void scout_attention_kernel(
         for (int kt = 0; kt < num_k_tiles; ++kt) {
             int k_tile_start = kt * TK;
 
+            // ---- Causal scout phase: classify tile before loading ----
+            if (causal) {
+                CausalTileType ct = classify_causal_tile(q_tile_start, k_tile_start, TQ, TK);
+                if (ct == TILE_FULLY_MASKED) {
+                    // Entire tile is in the causal future; free skip.
+                    tiles_skipped_qi++;
+                    if (qi == 0) skipped++;
+                    continue;
+                }
+                // TILE_PARTIAL and TILE_FULLY_VISIBLE continue to scout phase.
+                // The scout score for partial tiles is adjusted below.
+            }
+
             // ---- Phase 1: Scout ----
             // Load first DS columns of K tile
             if (tid == 0) {
@@ -123,6 +144,18 @@ __global__ void scout_attention_kernel(
                 float scout = 0.0f;
                 for (int d = 0; d < DS; ++d) scout += q_ptr[d] * k_mean[d];
                 scout = scout * scale / (float)DS;
+
+                // For partial causal tiles, scale down the scout score by the
+                // visible fraction. This prevents overestimating tile importance
+                // when most keys in the tile are masked.
+                if (causal) {
+                    CausalTileType ct = classify_causal_tile(q_tile_start, k_tile_start, TQ, TK);
+                    if (ct == TILE_PARTIAL) {
+                        float vis = causal_visible_fraction(q_tile_start, k_tile_start, TQ, TK);
+                        scout *= vis;
+                    }
+                }
+
                 skip_tile = (scout < thresh);
             }
 
@@ -167,6 +200,10 @@ __global__ void scout_attention_kernel(
                 for (int ki = 0; ki < TK; ++ki) {
                     int k_row = k_tile_start + ki;
                     if (k_row >= S_k) { logits[ki] = -1e38f; continue; }
+
+                    // Apply causal mask: positions where k_row > q_row are invalid.
+                    if (causal && k_row > q_row) { logits[ki] = -1e38f; continue; }
+
                     float dot = 0.0f;
                     const float* k_ptr = smem_K + ki * D;
                     for (int d = 0; d < D; ++d) dot += q_ptr[d] * k_ptr[d];
@@ -175,21 +212,30 @@ __global__ void scout_attention_kernel(
                     min_kept_logit = fminf(min_kept_logit, logits[ki]);
                 }
 
-                float new_max = fmaxf(row_max, tile_max);
-                float rescale = expf(row_max - new_max);
-                float tile_sum = 0.0f;
-                for (int ki = 0; ki < TK; ++ki) {
-                    logits[ki] = expf(logits[ki] - new_max);
-                    tile_sum += logits[ki];
+                // If all logits are -inf (can happen for partial causal tiles),
+                // skip the softmax update entirely to avoid NaN.
+                if (tile_max <= -1e37f) goto next_tile;
+
+                {
+                    float new_max = fmaxf(row_max, tile_max);
+                    float rescale = expf(row_max - new_max);
+                    float tile_sum = 0.0f;
+                    for (int ki = 0; ki < TK; ++ki) {
+                        logits[ki] = (logits[ki] > -1e37f)
+                            ? expf(logits[ki] - new_max)
+                            : 0.0f;
+                        tile_sum += logits[ki];
+                    }
+                    for (int d = 0; d < D; ++d) acc[d] *= rescale;
+                    for (int ki = 0; ki < TK; ++ki) {
+                        const float* v_ptr = smem_V + ki * D;
+                        for (int d = 0; d < D; ++d)
+                            acc[d] += logits[ki] * v_ptr[d];
+                    }
+                    row_sum = row_sum * rescale + tile_sum;
+                    row_max = new_max;
                 }
-                for (int d = 0; d < D; ++d) acc[d] *= rescale;
-                for (int ki = 0; ki < TK; ++ki) {
-                    const float* v_ptr = smem_V + ki * D;
-                    for (int d = 0; d < D; ++d)
-                        acc[d] += logits[ki] * v_ptr[d];
-                }
-                row_sum = row_sum * rescale + tile_sum;
-                row_max = new_max;
+                next_tile:;
             }
             __syncthreads();
         }
@@ -226,7 +272,8 @@ void scout_attention(
     const float* Q, const float* K, const float* V,
     float* O, const AttentionParams& params,
     int d_scout, float keep_frac,
-    const float* thresholds, ScoutAttentionStats* stats)
+    const float* thresholds, ScoutAttentionStats* stats,
+    bool causal)
 {
     int D = params.head_dim;
     int B = params.batch_size;
@@ -267,7 +314,7 @@ void scout_attention(
     // Production code would template over d_scout values (8, 16, 32).
     scout_attention_kernel<TILE_Q, TILE_K, D_SCOUT><<<grid, block, smem>>>(
         Q, K, V, O, d_thresholds, d_skip_counts,
-        B, H, S_q, S_k, D, params.scale, keep_frac, num_q_tiles);
+        B, H, S_q, S_k, D, params.scale, keep_frac, num_q_tiles, causal);
     CUDA_CHECK(cudaGetLastError());
 
     if (stats) {

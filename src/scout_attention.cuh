@@ -24,6 +24,8 @@ struct ScoutAttentionStats {
 //   keep_frac  -- fraction of tiles to keep (default: SCOUT_KEEP_FRAC)
 //   thresholds -- optional precomputed per-query-tile thresholds [B,H,num_q_tiles]
 //                 pass nullptr to use adaptive per-row EMA threshold
+//   causal     -- if true, apply lower-triangular causal mask; tiles entirely in
+//                 the causal future are skipped unconditionally (free sparsity)
 void scout_attention(
     const float* Q,           // [B, H, S_q, D]
     const float* K,           // [B, H, S_k, D]
@@ -33,5 +35,6 @@ void scout_attention(
     int          d_scout    = D_SCOUT,
     float        keep_frac  = SCOUT_KEEP_FRAC,
     const float* thresholds = nullptr,
-    ScoutAttentionStats* stats = nullptr
+    ScoutAttentionStats* stats = nullptr,
+    bool         causal     = false
 );
